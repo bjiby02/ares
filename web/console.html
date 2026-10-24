@@ -1,0 +1,154 @@
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>ARES // Global Operations</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#000;--pan:#080808;--pan2:#0e0e0e;--edge:#222;--grid:#0e0e0e;
+--tx:#fff;--mu:#8a8a8a;--dim:#4a4a4a;--cy:#5ce65c;--am:#f2a33c;--rd:#ff4d3d;--vi:#9a8bff}
+body{background:var(--bg);color:var(--tx);font:12px/1.4 "Helvetica Neue",Helvetica,Arial,sans-serif;
+height:100vh;overflow:hidden;background-image:linear-gradient(var(--grid) 1px,transparent 1px),
+linear-gradient(90deg,var(--grid) 1px,transparent 1px);background-size:62px 62px}
+.mono{font-family:Menlo,Monaco,monospace}
+#app{display:grid;grid-template-rows:34px 1fr 104px 190px;height:100vh;gap:2px;padding:2px}
+.bar{background:var(--pan2);display:flex;align-items:center;gap:10px;padding:0 10px;border:1px solid var(--edge)}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--cy)}
+.brand{font-weight:700;font-size:13px;letter-spacing:.4px}
+.sub{font-family:Menlo,monospace;font-size:9px;color:var(--mu);letter-spacing:.6px}
+.chip{font-family:Menlo,monospace;font-size:8.5px;padding:3px 7px;border:1px solid var(--edge);color:var(--mu);cursor:pointer;user-select:none}
+.chip.on{background:var(--cy);color:#000;border-color:var(--cy);font-weight:700}
+.chip.am.on{background:var(--am);border-color:var(--am)}
+.spacer{flex:1}
+.stat{font-family:Menlo,monospace;font-size:9px;color:var(--mu)}
+.stat b{color:var(--tx)}
+#mid{display:grid;grid-template-columns:186px 1fr;gap:2px;min-height:0}
+.panel{background:var(--pan);border:1px solid var(--edge);display:flex;flex-direction:column;min-height:0}
+.ph{background:var(--pan2);padding:4px 7px;font-family:Menlo,monospace;font-size:8.5px;
+color:var(--cy);letter-spacing:.7px;display:flex;justify-content:space-between;flex:none}
+.ph span{color:var(--dim)}
+.pb{padding:7px;overflow:auto;min-height:0;flex:1}
+.lbl{font-family:Menlo,monospace;font-size:8px;color:var(--mu);letter-spacing:.6px;margin:8px 0 4px}
+.lbl:first-child{margin-top:0}
+.row{display:flex;align-items:center;gap:6px;padding:2.5px 0;font-family:Menlo,monospace;font-size:8.5px;color:var(--mu);cursor:pointer}
+.row input{appearance:none;width:9px;height:9px;border:1px solid var(--edge);flex:none}
+.row input:checked{border-color:currentColor;box-shadow:inset 0 0 0 2px currentColor}
+.row.on{color:var(--tx)}
+.row .r{margin-left:auto;color:var(--dim)}
+#mapwrap{position:relative;background:#000;overflow:hidden}
+svg#map{width:100%;height:100%;display:block}
+.land{fill:#0c0c0c;stroke:#2e2e2e;stroke-width:.4}
+.grat{stroke:#0b0b0b;stroke-width:.3}
+#bottom{display:grid;grid-template-columns:260px 1fr 230px;gap:2px;min-height:0}
+.feed div.f{display:flex;gap:6px;padding:3px 0;border-left:2px solid var(--edge);padding-left:6px;margin-bottom:3px}
+.feed .t{font-family:Menlo,monospace;font-size:8px;color:var(--dim);flex:none}
+.feed .s{font-family:Menlo,monospace;font-size:8px;font-weight:700;flex:none}
+.feed .m{font-size:9.5px;color:var(--mu);line-height:1.25}
+#cams{display:grid;grid-template-columns:repeat(5,1fr);grid-template-rows:repeat(2,1fr);gap:4px;height:100%}
+.cam{background:#0c0c0c;border:1px solid var(--edge);position:relative;display:flex;align-items:center;justify-content:center}
+.cam.hot{border-color:var(--vi)}
+.cam i{font-family:Menlo,monospace;font-size:7px;color:var(--dim);font-style:normal}
+.cam b{position:absolute;bottom:2px;left:3px;font-family:Menlo,monospace;font-size:7px;color:var(--dim);font-weight:400}
+.cam.hot b{color:var(--vi);font-weight:700}
+.cam s{position:absolute;top:3px;right:3px;width:5px;height:5px;border-radius:50%;background:var(--rd)}
+table{width:100%;border-collapse:collapse;font-size:9.5px}
+th{font-family:Menlo,monospace;font-size:7.5px;color:var(--dim);text-align:left;font-weight:400;
+padding:3px 5px;border-bottom:1px solid var(--edge);letter-spacing:.5px}
+td{padding:3.5px 5px;border-bottom:1px solid #101010;color:var(--mu)}
+td.k{color:var(--tx)}
+tr.p0 td{background:#140808}
+tr.p0 td:first-child{box-shadow:inset 2px 0 0 var(--rd)}
+.pill{font-family:Menlo,monospace;font-size:7.5px;font-weight:700}
+.cy{color:var(--cy)}.am{color:var(--am)}.rd{color:var(--rd)}.vi{color:var(--vi)}.dm{color:var(--dim)}
+.brief p{font-size:10px;color:var(--mu);margin-bottom:5px;line-height:1.35}
+.meter{height:7px;background:#121212;margin:6px 0 3px}
+.meter i{display:block;height:100%;background:var(--cy)}
+.big{font-size:22px;font-weight:700;letter-spacing:-.5px}
+
+#duo{min-height:0}
+#duo .pb{padding:6px 8px;overflow:hidden}
+.lane{display:grid;grid-template-columns:74px 1fr;align-items:center;height:26px}
+.lane .nm{font-family:Menlo,monospace;font-size:7.5px;color:var(--mu);letter-spacing:.5px}
+.lane .nm i{display:block;font-style:normal;font-size:6.5px;color:var(--dim)}
+.track{position:relative;height:16px;background:#0a0a0a;border:1px solid #141414}
+.seg{position:absolute;top:1px;bottom:1px;border-radius:1px;display:flex;align-items:center;
+padding:0 5px;font-family:Menlo,monospace;font-size:6.5px;font-weight:700;color:#000;overflow:hidden;white-space:nowrap}
+.seg.live{background:var(--cy)}
+.seg.async{background:var(--vi)}
+.seg.caller{background:var(--am)}
+.seg.sup{background:transparent;border:1px dashed #3a2020;color:var(--rd);font-weight:400}
+.weave{position:absolute;top:-4px;width:1px;height:24px;background:var(--cy)}
+
+button.act{font-family:Menlo,monospace;font-size:7.5px;font-weight:700;letter-spacing:.4px;
+padding:2px 6px;border:1px solid var(--cy);background:transparent;color:var(--cy);cursor:pointer}
+button.act:hover{background:var(--cy);color:#000}
+button.act:disabled{opacity:.4;cursor:wait}
+</style></head><body><div id="app">
+
+<div class="bar">
+  <div class="dot"></div><div class="brand">ARES</div>
+  <div class="sub">GLOBAL OPERATIONS</div>
+  <div class="chip on">LIVE</div>
+  <div class="chip am on" id="surge">SURGE 3.1x</div>
+  <div class="chip">2D</div><div class="chip on">3D</div>
+  <div class="spacer"></div>
+  <div class="stat" id="clock">--:--:--</div>
+  <div class="stat"><b id="nHandled">0</b> HANDLED</div>
+  <div class="stat"><b id="nEsc">0</b> TO HUMANS</div>
+  <div class="stat"><b id="nAbs">0%</b> ABSORBED</div>
+  <div class="stat">p50 <b>0.79s</b></div>
+</div>
+
+<div id="mid">
+  <div class="panel">
+    <div class="ph">LAYERS<span id="nLayers">11</span></div>
+    <div class="pb">
+      <div class="lbl">WINDOW</div>
+      <div style="display:flex;gap:3px;flex-wrap:wrap">
+        <div class="chip on">1h</div><div class="chip">6h</div><div class="chip">24h</div>
+        <div class="chip">7d</div><div class="chip">ALL</div>
+      </div>
+      <div class="lbl">LAYERS</div>
+      <div id="layers"></div>
+      <div class="lbl">SATELLITE PASSES</div>
+      <div id="sats"></div>
+      <div class="lbl">FEED HEALTH</div>
+      <div id="feeds"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="ph">GLOBAL SITUATION<span id="mapstat">-</span></div>
+    <div id="mapwrap">
+      <svg id="map" viewBox="0 0 360 180" preserveAspectRatio="xMidYMid meet">
+        <g id="grat"></g>
+        <g class="land"><path d="M12.0 25.0 L20.0 19.0 L40.0 20.0 L55.0 20.0 L70.0 22.0 L85.0 21.0 L100.0 17.0 L118.0 24.0 L125.0 38.0 L114.0 45.0 L110.0 48.0 L105.0 55.0 L99.0 65.0 L83.0 64.0 L74.0 67.0 L66.0 60.0 L56.0 50.0 L55.0 42.0 L45.0 33.0 L30.0 30.0 Z"/>
+      <path d="M99.0 81.0 L104.0 79.0 L120.0 79.0 L130.0 90.0 L145.0 96.0 L141.0 112.0 L132.0 118.0 L122.0 129.0 L117.0 132.0 L114.0 145.0 L107.0 142.0 L107.0 130.0 L109.0 120.0 L110.0 108.0 L102.0 95.0 L101.0 88.0 Z"/>
+      <path d="M170.0 54.0 L180.0 46.0 L190.0 46.0 L198.0 50.0 L205.0 50.0 L210.0 53.0 L216.0 54.0 L223.0 78.0 L231.0 78.0 L223.0 91.0 L220.0 105.0 L215.0 114.0 L206.0 124.0 L198.0 124.0 L192.0 108.0 L189.0 86.0 L183.0 84.0 L172.0 85.0 L163.0 75.0 L164.0 68.0 Z"/>
+      <path d="M206.0 50.0 L220.0 44.0 L230.0 45.0 L240.0 45.0 L250.0 48.0 L260.0 60.0 L268.0 68.0 L272.0 68.0 L277.0 74.0 L283.0 89.0 L290.0 80.0 L297.0 67.0 L302.0 59.0 L307.0 52.0 L310.0 47.0 L315.0 40.0 L322.0 36.0 L330.0 31.0 L340.0 29.0 L350.0 24.0 L358.0 21.0 L340.0 18.0 L320.0 17.0 L300.0 16.0 L280.0 14.0 L260.0 17.0 L240.0 20.0 L220.0 23.0 L208.0 20.0 L202.0 24.0 L210.0 30.0 L208.0 38.0 Z"/>
+      <path d="M293.0 112.0 L299.0 110.0 L307.0 104.0 L316.0 102.0 L322.0 101.0 L326.0 108.0 L331.0 114.0 L333.0 119.0 L330.0 127.0 L323.0 129.0 L315.0 125.0 L309.0 122.0 L303.0 124.0 L295.0 124.0 Z"/></g>
+        <g id="pins"></g>
+      </svg>
+    </div>
+  </div>
+</div>
+
+<div class="panel" id="duo">
+  <div class="ph">VOICE PATH &middot; <span id="vxport">twilio/twiml</span><span id="vxtools">4 TOOLS</span></div>
+  <div class="pb" id="lanes"></div>
+</div>
+
+<div id="bottom">
+  <div class="panel">
+    <div class="ph">ALERT FEED<span class="cy">LIVE</span></div>
+    <div class="pb feed" id="alerts"></div>
+  </div>
+  <div class="panel">
+    <div class="ph">CAMERA WALL &middot; ALERTCALIFORNIA<span>28 IN RANGE &nbsp; NEAREST 2.1 km</span></div>
+    <div class="pb"><div id="cams"></div></div>
+  </div>
+  <div class="panel">
+    <div class="ph">DECISION BRIEF<span class="cy">LIVE</span></div>
+    <div class="pb brief" id="brief"></div>
+  </div>
+</div>
+</div>
+<script src="console.js"></script></body></html>

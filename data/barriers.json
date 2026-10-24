@@ -1,0 +1,14 @@
+[
+  {
+    "name": "San Diego Bay",
+    "note": "downtown to Coronado crosses open water",
+    "from": [
+      -117.18,
+      32.712
+    ],
+    "to": [
+      -117.145,
+      32.69
+    ]
+  }
+]

@@ -1,0 +1,10 @@
+[
+  {"name": "RIMAC Field assembly area",        "lat": 32.88680, "lon": -117.23960},
+  {"name": "Warren Mall assembly area",        "lat": 32.88100, "lon": -117.23580},
+  {"name": "Sun God Lawn assembly area",       "lat": 32.87930, "lon": -117.23700},
+  {"name": "Revelle Plaza assembly area",      "lat": 32.87430, "lon": -117.24120},
+  {"name": "Muir Field assembly area",         "lat": 32.87880, "lon": -117.24220},
+  {"name": "Marshall Field assembly area",     "lat": 32.88310, "lon": -117.24220},
+  {"name": "Torrey Pines Center assembly area","lat": 32.88900, "lon": -117.23200},
+  {"name": "La Jolla Cove open ground",        "lat": 32.85090, "lon": -117.27130}
+]

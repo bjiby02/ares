@@ -1,0 +1,14 @@
+# secrets and local state
+.env
+data/*.db
+data/*.db-wal
+data/*.db-shm
+data/api_token
+devcert/
+
+# config that belongs in the repo
+!data/refuges.json
+!data/barriers.json
+
+__pycache__/
+*.pyc
