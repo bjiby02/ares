@@ -56,6 +56,13 @@ MEDICAL = (
     "chest pain",
     "broken",
     "dizzy",
+    "can't breathe",
+    "cannot breathe",
+    "cant breathe",
+    "not breathing",
+    "stopped breathing",
+    "unconscious",
+    "heart attack",
 )
 FIRE = ("smoke", "fire", "flames", "wildfire", "burning")
 WATER = ("flood", "flooding", "water is rising", "water rising")
@@ -91,6 +98,14 @@ CLOSE = {
     "i'm safe now",
     "i am safe now",
 }
+SAFE_NOW = (
+    "made it", "safe", "got out", "i am out", "i'm out", "im out",
+    "all clear", "i'm fine", "im fine", "i am fine", "we are fine", "we're fine",
+    "i'm ok", "im ok", "i am ok", "i'm okay", "im okay", "i am okay",
+    "we are ok", "we're ok", "we are okay", "no longer need", "don't need help",
+    "do not need help", "dont need help", "false alarm", "never mind",
+    "nevermind", "cancel",
+)
 CORRECT = {
     "no",
     "nope",
@@ -182,18 +197,20 @@ def place_candidates(text: str) -> list[str]:
 
 
 def _place(text: str) -> str | None:
-    match = re.search(r"\b(?:at|near|inside|on|by)\s+(.+)", text, re.I)
-    if not match:
-        match = re.search(r"\bin\s+(.+)", text, re.I)
-    if not match:
-        return None
-    chunk = match.group(1)
-    # Same terminators place_candidates already uses. Without the comma,
-    # "at Geisel Library, I need to get out" is searched whole and fuzzy-matches
-    # Geisler Library in Pella, Iowa.
-    chunk = re.split(r"[,.]", chunk, maxsplit=1)[0]
-    chunk = re.split(r"\b(?:and|but|with|there|smoke|fire|flood)\b", chunk, maxsplit=1, flags=re.I)[0]
-    return _usable_place(chunk)
+    # Try every marker. "the fire is inside and I am at Birch" must keep Birch,
+    # and "inside Geisel Library" must still count.
+    pattern = re.compile(r"\b(?:at|near|inside|on|by|in)\b", re.I)
+    for match in pattern.finditer(text):
+        chunk = text[match.end():]
+        # Same terminators place_candidates already uses. Without the comma,
+        # "at Geisel Library, I need to get out" is searched whole and fuzzy-matches
+        # Geisler Library in Pella, Iowa.
+        chunk = re.split(r"[,.]", chunk, maxsplit=1)[0]
+        chunk = re.split(r"\b(?:and|but|with|there|smoke|fire|flood)\b", chunk, maxsplit=1, flags=re.I)[0]
+        usable = _usable_place(chunk)
+        if usable:
+            return usable
+    return None
 
 
 def _usable_place(chunk: str) -> str | None:
@@ -226,6 +243,25 @@ def _ground_mobility(text: str, result: dict) -> dict:
         out["need"] = out.get("need") or "medical"
     out["action"] = "guide" if out.get("place") else "ask"
     print("escalation ungrounded: no immobility in the utterance, downgraded", flush=True)
+    return out
+
+
+def _ground_close(text: str, result: dict) -> dict:
+    """Hanging up must be grounded in words the caller actually said.
+
+    A model will read "I am at the hospital and I need to get out" as a person
+    who is already safe, because the venue sounds safe. It is not: they asked
+    for help. Closing there drops the call and opens no incident, so nobody
+    ever sees it. Safety is a claim only the caller may make.
+    """
+    if result.get("action") != "close":
+        return result
+    low = " ".join(text.split()).casefold()
+    if any(phrase in low for phrase in SAFE_NOW):
+        return result                      # they said it; believe them
+    out = dict(result)
+    out["action"] = "guide" if out.get("place") else "ask"
+    print("close ungrounded: caller never said they were safe, downgraded", flush=True)
     return out
 
 
@@ -330,7 +366,7 @@ def classify(text: str) -> dict:
     spans = place_candidates(text)
     if os.environ.get("TYPESAFE_API_KEY"):
         try:
-            decision = _clean(_ground_mobility(text, _ground(text, jev.judge(text, spans))))
+            decision = _clean(_ground_close(text, _ground_mobility(text, _ground(text, jev.judge(text, spans)))))
             print(
                 f"jev action={decision['action']} need={decision['need']} hazard={decision['hazard']}",
                 flush=True,
@@ -340,9 +376,9 @@ def classify(text: str) -> dict:
             print(f"jev unavailable: {exc}", flush=True)
     try:
         if os.environ.get("OPENAI_API_KEY"):
-            return _clean(_ground_mobility(text, _ground(text, _openai(text))))
+            return _clean(_ground_close(text, _ground_mobility(text, _ground(text, _openai(text)))))
         if os.environ.get("ANTHROPIC_API_KEY"):
-            return _clean(_ground_mobility(text, _ground(text, _anthropic(text))))
+            return _clean(_ground_close(text, _ground_mobility(text, _ground(text, _anthropic(text)))))
     except (OSError, KeyError, ValueError, json.JSONDecodeError, TimeoutError):
         pass
     return fallback(text)

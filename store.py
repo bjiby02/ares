@@ -44,6 +44,8 @@ class Store:
     def __init__(self, path: str):
         Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
+        self._watch = threading.Condition()
+        self._version = 0
         self.db = sqlite3.connect(path, check_same_thread=False, isolation_level=None)
         self.db.row_factory = sqlite3.Row
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -183,12 +185,49 @@ class Store:
             except Exception:
                 self.db.execute("ROLLBACK")
                 raise
+        self.bump()
         return Result(body, incident_id, True, changed, say, sms)
+
+    def bump(self) -> int:
+        """Mark that something changed, and wake anyone watching the queue."""
+        with self._watch:
+            self._version += 1
+            self._watch.notify_all()
+            return self._version
+
+    def wait_for_change(self, seen: int, timeout: float = 25.0) -> int:
+        """Block until the queue moves, or the timeout lapses. Returns the version."""
+        with self._watch:
+            if self._version != seen:
+                return self._version
+            self._watch.wait(timeout)
+            return self._version
+
+    def reset_calls(self) -> int:
+        """Clear every call, keeping the geocache that makes the demo fast.
+
+        A delete made from outside is invisible to this connection, so the
+        reset has to run here or the console keeps serving the old queue.
+        """
+        with self.lock:
+            gone = self.db.execute("SELECT COUNT(*) AS n FROM incidents").fetchone()["n"]
+            self.db.execute("BEGIN IMMEDIATE")
+            try:
+                for table in ("incidents", "sessions", "turns", "responses"):
+                    self.db.execute(f"DELETE FROM {table}")
+                self.db.execute("COMMIT")
+                self.bump()
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+        return int(gone)
 
     def incidents(self, limit: int = 50) -> list[dict]:
         with self.lock:
             rows = self.db.execute(
-                "SELECT * FROM incidents ORDER BY priority ASC, updated_at DESC LIMIT ?",
+                # Oldest first inside a band. Waiting makes a call more urgent,
+                # not less, and the previous sort buried whoever had gone quiet.
+                "SELECT * FROM incidents ORDER BY priority ASC, updated_at ASC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [dict(row) for row in rows]
@@ -209,9 +248,13 @@ class Store:
             row = self.db.execute("SELECT id FROM incidents WHERE id = ?", (incident_id,)).fetchone()
             if row is None:
                 return None
-            fields = ["responder_state = ?", "responder = ?", "responder_note = ?",
+            fields = ["responder_state = ?", "responder = ?",
                       "responder_at = ?", "caller_told = 0", "updated_at = ?"]
-            values = [state, who or "dispatch", note or "", now(), now()]
+            values = [state, who or "dispatch", now(), now()]
+            # An empty note must not wipe the help already chosen.
+            if note:
+                fields.insert(2, "responder_note = ?")
+                values.insert(2, note)
             if supervised is not None:
                 fields.append("supervised = ?")
                 values.append(1 if supervised else 0)
@@ -223,14 +266,24 @@ class Store:
                 (*values, incident_id),
             )
             out = self.db.execute("SELECT * FROM incidents WHERE id = ?", (incident_id,)).fetchone()
+        self.bump()
         return dict(out) if out else None
 
     def open_for(self, phone: str) -> dict | None:
-        """The caller's live incident, so their next turn can carry responder news."""
+        """The caller's live incident, so their next turn can carry responder news.
+
+        A just-closed incident stays visible for one turn when the caller has not
+        yet been told it is closed. After that sentence, it drops off the call.
+        """
         with self.lock:
             row = self.db.execute(
                 "SELECT * FROM incidents WHERE phone = ? AND status != 'closed' "
                 "ORDER BY updated_at DESC LIMIT 1", (phone,)).fetchone()
+            if row is None:
+                row = self.db.execute(
+                    "SELECT * FROM incidents WHERE phone = ? AND status = 'closed' "
+                    "AND caller_told = 0 AND COALESCE(responder_state, '') != '' "
+                    "ORDER BY updated_at DESC LIMIT 1", (phone,)).fetchone()
         return dict(row) if row else None
 
     def mark_told(self, incident_id: int) -> None:
@@ -315,6 +368,7 @@ class Store:
                 """,
                 (*values, stamp, existing),
             )
+            self._line_takes(existing, incident, stamp)
             return existing
         cursor = self.db.execute(
             """
@@ -326,4 +380,21 @@ class Store:
             """,
             (*values, stamp, stamp),
         )
-        return int(cursor.lastrowid)
+        incident_id = int(cursor.lastrowid)
+        self._line_takes(incident_id, incident, stamp)
+        return incident_id
+
+    def _line_takes(self, incident_id: int, incident: dict, stamp: str) -> None:
+        """The agent already has the call. A later turn must not replace that unit."""
+        unit = incident.get("auto_help")
+        if not unit:
+            return
+        self.db.execute(
+            """
+            UPDATE incidents
+            SET responder_state = ?, responder_note = ?, responder = ?,
+                responder_at = ?, caller_told = 1
+            WHERE id = ? AND COALESCE(responder_state, '') = ''
+            """,
+            ("en_route", unit, "line", stamp, incident_id),
+        )

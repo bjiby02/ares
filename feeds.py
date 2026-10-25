@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import threading
 import time
 import pathlib
@@ -113,10 +114,14 @@ def cameras(lat: float, lon: float, radius_m: int = 40000) -> list[dict]:
             if g.get("x") is None:
                 continue
             clon, clat = _webmerc_to_lonlat(g["x"], g["y"])
+            image = a.get("imageURL") or ""
             out.append({
+                "id": _camera_id(image, a.get("OBJECTID"), a.get("cameraName")),
                 "name": a.get("cameraName") or a.get("siteId") or "camera",
                 "site": a.get("siteId"),
                 "url": a.get("cameraURL"),
+                "image": image,
+                "online": a.get("isOnline") or "",
                 "lat": round(clat, 5), "lon": round(clon, 5),
                 "km": round(_haversine_km(lat, lon, clat, clon), 2),
             })
@@ -124,6 +129,46 @@ def cameras(lat: float, lon: float, radius_m: int = 40000) -> list[dict]:
         return out
 
     return cached(key, CAMERA_TTL, fetch) or []
+
+
+def _camera_id(image: str, object_id, name) -> str:
+    """Stable id for one camera still. Taken from the image path, not invented."""
+    marker = "/public-camera-data/"
+    if isinstance(image, str) and marker in image:
+        slug = image.split(marker, 1)[1].split("/", 1)[0]
+        if slug:
+            return slug
+    if object_id is not None:
+        return str(object_id)
+    return str(name or "camera")
+
+
+_FRAME_TTL = 12.0
+_FRAMES: dict[str, dict] = {}
+
+
+def camera_jpeg(lat: float, lon: float, camera_id: str) -> bytes | None:
+    """Latest still for a camera we already know about. Refuses any other URL."""
+    if not camera_id or len(camera_id) > 80:
+        return None
+    cams = cameras(lat, lon)
+    match = next((c for c in cams if c.get("id") == camera_id), None)
+    image = (match or {}).get("image") or ""
+    if not image.startswith("https://cameras.alertcalifornia.org/"):
+        return None
+    now = time.time()
+    with _LOCK:
+        hit = _FRAMES.get(camera_id)
+        if hit and now - hit["at"] < _FRAME_TTL:
+            return hit["bytes"]
+    req = urllib.request.Request(image, headers={"User-Agent": UA, "Accept": "image/jpeg"})
+    with urllib.request.urlopen(req, timeout=8) as resp:
+        blob = resp.read(2_000_000)
+    if not blob:
+        return None
+    with _LOCK:
+        _FRAMES[camera_id] = {"at": time.time(), "bytes": blob}
+    return blob
 
 
 def _haversine_km(a_lat, a_lon, b_lat, b_lon) -> float:
@@ -158,6 +203,95 @@ def fires(lat: float, lon: float, radius_m: int = 120000) -> list[dict]:
     return cached(key, FIRE_TTL, fetch) or []
 
 
+def fire_rings(lat: float, lon: float, radius_m: int = 120000) -> list[dict]:
+    """The same fires, with their outlines, so a route can be kept out of one.
+
+    `fires()` drops the geometry because the console only prints a name. The
+    router needs the shape. Simplified to 100 m, which is far finer than any
+    instruction we give on foot, and keeps the payload small.
+    """
+    key = f"firegeom:{lat:.1f},{lon:.1f}"
+
+    def fetch():
+        base = ("https://services3.arcgis.com/T4QMspbfLg3qTGWY/arcgis/rest/services/"
+                "WFIGS_Interagency_Perimeters_Current/FeatureServer/0/query")
+        qs = urllib.parse.urlencode({
+            "geometry": f"{lon},{lat}", "geometryType": "esriGeometryPoint", "inSR": "4326",
+            "distance": radius_m, "units": "esriSRUnit_Meter",
+            "spatialRel": "esriSpatialRelIntersects",
+            "outFields": "poly_IncidentName,poly_GISAcres",
+            "returnGeometry": "true", "outSR": "4326",
+            "maxAllowableOffset": "0.001", "f": "json",
+        })
+        data = _get(f"{base}?{qs}", timeout=12)
+        out = []
+        for feature in data.get("features", []):
+            rings = ((feature.get("geometry") or {}).get("rings")) or []
+            keep = [ring for ring in rings if isinstance(ring, list) and len(ring) >= 4]
+            if not keep:
+                continue
+            attrs = feature.get("attributes") or {}
+            out.append({
+                "name": (attrs.get("poly_IncidentName") or "unnamed").title(),
+                "acres": round(attrs.get("poly_GISAcres") or 0),
+                "rings": keep,
+            })
+        return out
+
+    return cached(key, FIRE_TTL, fetch) or []
+
+
+HOTSPOT_TTL = 900.0
+
+
+def hotspots(lat: float, lon: float, span_deg: float = 0.7, days: int = 2) -> list[dict]:
+    """VIIRS active-fire detections from NASA FIRMS.
+
+    These are hours old by the time they land, so they never choose a route.
+    They corroborate: a caller cluster that lands on a satellite detection is
+    a fire two independent systems agree on.
+    """
+    key = os.environ.get("FIRMS_MAP_KEY", "").strip()
+    if not key:
+        return []
+    cache_key = f"viirs:{lat:.1f},{lon:.1f}"
+
+    def fetch():
+        box = (f"{lon - span_deg:.3f},{lat - span_deg:.3f},"
+               f"{lon + span_deg:.3f},{lat + span_deg:.3f}")
+        rows: list[dict] = []
+        for source in ("VIIRS_SNPP_NRT", "VIIRS_NOAA20_NRT"):
+            url = (f"https://firms.modaps.eosdis.nasa.gov/api/area/csv/"
+                   f"{key}/{source}/{box}/{days}")
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": UA})
+                with urllib.request.urlopen(req, timeout=12) as resp:
+                    text = resp.read().decode("utf-8", "replace")
+            except (OSError, ValueError):
+                continue
+            lines = [line for line in text.strip().splitlines() if line]
+            if len(lines) < 2:
+                continue
+            cols = lines[0].split(",")
+            for line in lines[1:]:
+                cell = dict(zip(cols, line.split(",")))
+                try:
+                    rows.append({
+                        "lat": float(cell["latitude"]),
+                        "lon": float(cell["longitude"]),
+                        "kelvin": round(float(cell.get("bright_ti4") or 0), 1),
+                        "confidence": cell.get("confidence", ""),
+                        "at": f"{cell.get('acq_date','')} {cell.get('acq_time','').zfill(4)}Z",
+                        "sat": cell.get("satellite", ""),
+                    })
+                except (KeyError, ValueError):
+                    continue
+        rows.sort(key=lambda r: _haversine_km(lat, lon, r["lat"], r["lon"]))
+        return rows[:40]
+
+    return cached(cache_key, HOTSPOT_TTL, fetch) or []
+
+
 # ---------------------------------------------------------------- bundle
 def situation(lat: float, lon: float) -> dict:
     """Everything the console needs, in one cached call."""
@@ -170,6 +304,7 @@ def situation(lat: float, lon: float) -> dict:
         "cameras": cams[:12],
         "camera_count": len(cams),
         "fires": fs,
+        "hotspots": hotspots(lat, lon),
         "generated_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
 

@@ -185,12 +185,23 @@ def call(store, name: str, phone: str, spoken: str) -> dict:
 def session_config(public_base: str) -> dict:
     """Body for POST /v1/live/sessions.
 
-    That endpoint accepts only model and instructions. Everything else — tools,
-    voice, turn detection — is applied with session.update once the data channel
-    is open, which is why the browser sends session_update() on connect.
+    The voice model delegates every route and escalation to this application.
+    The browser returns the line's sentence for the model to speak.
     """
     del public_base
-    return {"model": "gpt-live-1", "instructions": PROMPT}
+    return {
+        "model": "gpt-live-1",
+        "instructions": (
+            "You are a calm emergency dispatcher on a live call. You do not know the caller's name. "
+            "Never say a person's name.\n"
+            "When an instruction gives you words to say, say those words once, in a steady voice, "
+            "then stop and listen. Do not add a building, a road, or a hospital. Do not repeat yourself.\n"
+            "After the caller finishes a sentence, delegate to the application and stay silent "
+            "until the next instruction."
+        ),
+        "delegation": {"type": "client"},
+        "audio": {"output": {"voice": "vesper"}},
+    }
 
 
 def session_update() -> dict:

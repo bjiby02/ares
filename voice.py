@@ -26,8 +26,15 @@ def e164(number: str) -> str:
     return ""
 
 
+def plain_base(value: str) -> str:
+    value = (value or "").strip().rstrip("/")
+    if len(value) >= 2 and value[0] in "\"'" and value[-1] == value[0]:
+        value = value[1:-1].strip().rstrip("/")
+    return value
+
+
 def signed_url(request_url: str) -> str:
-    configured = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    configured = plain_base(os.environ.get("PUBLIC_BASE_URL", ""))
     path = urlparse(request_url).path or "/"
     if configured:
         return configured + path
@@ -58,22 +65,72 @@ def twiml(
     prompt: str = "",
     follow: str = "/gather",
 ) -> str:
-    voice_name = os.environ.get("OPERATOR_VOICE", "Polly.Joanna")
+    voice_name = os.environ.get("OPERATOR_VOICE", "Polly.Joanna-Neural")
     action = xml(f"{base.rstrip('/')}{follow}")
     parts = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         "<Response>",
-        f'<Say voice="{xml(voice_name)}">{xml(say)}</Say>',
     ]
     # Voice only. No <Message> is ever emitted: the caller is told everything
     # out loud, and a person running from a fire is not reading a text.
+    spoken = f'<Say voice="{xml(voice_name)}">{xml(say)}</Say>'
     if listen:
+        # A trial keypress must come back to this line. A speech-only gather
+        # treats that key as the end of the call and falls through to Hangup.
         hint = xml("repeat, wrong place, trapped, smoke, fire, flood")
         inner = f"<Say voice=\"{xml(voice_name)}\">{xml(prompt)}</Say>" if prompt else ""
         parts.append(
-            f'<Gather input="speech" action="{action}" method="POST" speechTimeout="auto" '
-            f'timeout="8" language="en-US" hints="{hint}">{inner}</Gather>'
+            f'<Gather input="speech dtmf" action="{action}" method="POST" speechTimeout="auto" '
+            f'actionOnEmptyResult="true" timeout="8" language="en-US" hints="{hint}">'
+            f"{spoken}{inner}</Gather>"
         )
-    parts.append("<Hangup/>")
+        parts.append(f'<Redirect method="POST">{action}</Redirect>')
+    else:
+        parts.append(spoken)
+        parts.append("<Hangup/>")
     parts.append("</Response>")
     return "".join(parts)
+
+
+def live_stream(url: str, caller: dict[str, str]) -> str:
+    """Answer a phone call by handing the audio to GPT-Live. No gather loop."""
+    pairs = (
+        ("token", caller.get("token") or ""),
+        ("from", caller.get("From") or caller.get("from") or ""),
+        ("city", caller.get("FromCity") or caller.get("city") or ""),
+        ("region", caller.get("FromState") or caller.get("region") or ""),
+        ("call", caller.get("CallSid") or caller.get("call") or ""),
+    )
+    params = "".join(
+        f'<Parameter name="{xml(name)}" value="{xml(value)}"/>'
+        for name, value in pairs if value
+    )
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response><Connect>"
+        f'<Stream url="{xml(url)}">{params}</Stream>'
+        "</Connect></Response>"
+    )
+
+
+def unavailable() -> str:
+    """Spoken only when GPT-Live itself cannot be reached."""
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        '<Say voice="Polly.Joanna">The line cannot take this call right now.</Say>'
+        "<Hangup/>"
+        "</Response>"
+    )
+
+
+def hold(base: str) -> str:
+    """Keep a trapped caller on the line without asking them to talk."""
+    action = xml(f"{base.rstrip('/')}/gather")
+    return (
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        "<Response>"
+        '<Pause length="4"/>'
+        f'<Redirect method="POST">{action}</Redirect>'
+        "</Response>"
+    )

@@ -47,7 +47,7 @@ def questions(spans: list[str]) -> dict:
         },
         "medical": {
             "type": "noul",
-            "instructions": "The caller is hurt, bleeding, or needs a hospital.",
+            "instructions": "The caller is hurt, bleeding, cannot breathe, is unconscious, or needs a hospital.",
         },
         "fire": {
             "type": "noul",

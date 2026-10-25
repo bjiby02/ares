@@ -57,12 +57,14 @@ font-family:Menlo,monospace;font-size:6.5px;font-weight:700;color:#000;white-spa
 
 <div class="hero">
   <h2>Say what is happening,<br>and where you are.</h2>
-  <p>Full duplex. Interrupt whenever you like — the line keeps listening while it
-     speaks, and keeps speaking while it looks things up.</p>
+  <p id="blurb">Press start. GPT Live answers. Say what is happening, and where you are.</p>
   <div class="row">
     <button id="go">START CALL</button>
     <button id="stop" class="ghost" disabled>HANG UP</button>
   </div>
+  <form id="typed" class="row">
+    <input id="said" autocomplete="off" placeholder="Or type it. GPT Live speaks the answer." style="flex:1;background:#000;color:#fff;border:1px solid #222;padding:12px 14px;font:13px Menlo,monospace">
+  </form>
 </div>
 
 <div class="grid">
@@ -72,7 +74,7 @@ font-family:Menlo,monospace;font-size:6.5px;font-weight:700;color:#000;white-spa
   </div>
   <div>
     <div class="panel">
-      <div class="ph">PATHS<span id="xport">webrtc</span></div>
+      <div class="ph">PATHS<span id="xport">gpt-live</span></div>
       <div class="pb" id="lanes"></div>
     </div>
     <div class="panel" style="margin-top:14px">

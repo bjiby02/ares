@@ -8,7 +8,7 @@ from dataclasses import dataclass, fields, replace
 import geo
 import swarm
 
-OPENING = "Operator. What is happening, and where are you?"
+OPENING = "I'm here. Tell me what is happening, and where you are."
 
 
 @dataclass
@@ -30,6 +30,8 @@ class CallState:
     story: str | None = None
     incident_id: int | None = None
     incident_status: str | None = None
+    help_sent: str | None = None
+    destination_name: str | None = None
 
 
 @dataclass
@@ -57,24 +59,42 @@ def state_to(state: CallState) -> dict:
     return {item.name: getattr(state, item.name) for item in fields(CallState)}
 
 
+OPEN_STATUS = ("escalated", "guided", "holding")
+
+
+def _resume(state: CallState) -> str:
+    """What a caller hears when they dial back on a call that is still open.
+
+    They already told us this. Asking again wastes the one thing they do not
+    have. The line picks up where it stopped, then asks one short question.
+    """
+    where = state.origin_label or state.place
+    opening = f"I still have your call from {where}." if where else "I still have your call."
+    helper = {
+        "Ambulance": "An ambulance is on the way to you.",
+        "Fire engine": "A fire engine is on the way to you.",
+    }.get(state.help_sent or "", "A rescue team is on the way to you." if state.help_sent else "")
+    if state.incident_status == "escalated":
+        tail = "Are you still inside?"
+    elif state.destination_name:
+        helper = helper or ""
+        opening = f"{opening} I sent you toward {state.destination_name}."
+        tail = "Are you on your way?"
+    else:
+        tail = "Has anything changed?"
+    return " ".join(part for part in (opening, helper, tail) if part)
+
+
 def greet(state: CallState) -> Effect:
     if state.pending and len(state.pending) >= 2:
         first = state.pending[0].get("label") or state.pending[0].get("name")
         second = state.pending[1].get("label") or state.pending[1].get("name")
         return Effect(say=f"Which one? {first}, or {second}?", state=state, action="ask")
-    if state.incident_status == "escalated" and state.incident_id:
-        return Effect(
-            say=f"Incident {state.incident_id} is open. Stay low. Tell me if something changed.",
-            state=state,
-            action="greet",
-        )
-    if state.incident_status in ("guided", "holding") and state.last_say and state.incident_id:
-        return Effect(
-            say=f"Incident {state.incident_id} is open. {state.last_say}",
-            state=state,
-            prompt="Say repeat, or tell me where you are now.",
-            action="greet",
-        )
+    if state.last_say and state.incident_status in OPEN_STATUS:
+        return Effect(say="", state=state, action="greet")
+    if state.incident_status in OPEN_STATUS:
+        line = _resume(state)
+        return Effect(say=line, state=replace(state, last_say=line), action="resume")
     return Effect(say=OPENING, state=state, action="greet")
 
 
@@ -174,24 +194,25 @@ def _finish(state: CallState, text: str, route, nearby=None) -> Effect:
     if dest is None:
         if state.hazard:
             direction = "I will not send you toward the danger. Stay in a solid building, or move away from it on foot."
-        else:
-            direction = "I could not find a staffed building nearby. Tell me another landmark."
+            return _holding(state, text, direction, refused=True)
+        direction = "I could not find a staffed building nearby. Tell me another landmark."
         return _holding(state, text, direction)
     origin = state.origin_label or state.place or "there"
     direction = f"From {origin}. {geo.instruction(dest, _hazard_kind(state))}"
     if heard is not None:
         # Say where it came from. The caller is being told something they did not report.
         direction = f"{heard.phrase} {direction}"
-    say = f"{direction} Incident {{incident}}."
     status = "guided"
     incident = _record(state, status, _priority(status, state.need), text, dest, direction,
                        hazard_inferred=heard is not None)
-    saved = replace(state, last_say=direction, incident_status=status, pending=None)
+    state, direction, incident = _speak_help(state, direction, incident)
+    say = _once(state, direction)
+    saved = replace(state, last_say=direction, incident_status=status, pending=None,
+                    destination_name=dest.name)
     return Effect(
         say=say,
         state=saved,
         incident=incident,
-        prompt="Say repeat, or say if that is the wrong place.",
         action="guide",
     )
 
@@ -215,28 +236,30 @@ def _escalate(state: CallState, text: str, origins) -> Effect:
         heard = "What building are you in?"
     direction = f"{line} {heard}"
     update = state.incident_status == "escalated"
-    say = f"{direction} Incident {{incident}}."
     incident = _record(state, "escalated", 0, text, None, line)
+    state, direction, incident = _speak_help(state, direction, incident)
+    say = _once(state, direction)
     saved = replace(state, last_say=direction, incident_status="escalated")
     return Effect(
         say=say,
         state=saved,
         responder_sms=_page(saved, text, update),
         incident=incident,
-        listen=not bool(state.place),
+        listen=True,
         action="escalate",
     )
 
 
-def _holding(state: CallState, text: str, direction: str) -> Effect:
-    say = f"{direction} Incident {{incident}}."
-    incident = _record(state, "holding", _priority("holding", state.need), text, None, direction)
+def _holding(state: CallState, text: str, direction: str, *, refused: bool = False) -> Effect:
+    incident = _record(state, "holding", _priority("holding", state.need, refused=refused),
+                       text, None, direction)
+    state, direction, incident = _speak_help(state, direction, incident)
+    say = _once(state, direction)
     saved = replace(state, last_say=direction, incident_status="holding", pending=None)
     return Effect(
         say=say,
         state=saved,
         incident=incident,
-        prompt="Tell me if you cannot do that.",
         action="hold",
     )
 
@@ -256,8 +279,16 @@ def _reject(state: CallState) -> Effect:
         origin_lon=None,
         pending=None,
         last_say="Where are you?",
+        destination_name=None,
     )
     return Effect(say="Where are you?", state=cleared, action="correct")
+
+
+def _once(state: CallState, direction: str) -> str:
+    """Say an instruction one time. A later turn does not read it again."""
+    if direction and direction == (state.last_say or ""):
+        return ""
+    return direction
 
 
 def _repeat(state: CallState) -> Effect:
@@ -275,8 +306,8 @@ def _close(state: CallState, text: str) -> Effect:
     page = ""
     if state.incident_status == "escalated":
         page = f"OPERATOR incident {{incident}} closed. Caller says they are safe.\n{state.phone}"
-    say = f"Incident {state.incident_id} is closed. Call again if you need to."
-    incident = _record(state, "closed", 0 if state.incident_status == "escalated" else 3, text, None, "closed")
+    say = "Call again if you need to."
+    incident = _record(state, "closed", 0 if state.incident_status == "escalated" else 4, text, None, "closed")
     saved = replace(state, incident_status="closed", pending=None, last_say=say)
     return Effect(say=say, state=saved, responder_sms=page, incident=incident, listen=False, action="close")
 
@@ -353,12 +384,50 @@ def _page(state: CallState, summary: str, update: bool) -> str:
     return f"OPERATOR P0 {kind} {{incident}}\n{state.phone}\n{place}\nhazard {hazard}\n{words}"
 
 
-def _priority(status: str, need: str | None) -> int:
-    if status == "escalated":
+def _priority(status: str, need: str | None, *, refused: bool = False) -> int:
+    """Where this call sits in the queue a human works down.
+
+    A refused caller shares the top band with a trapped one. We told them every
+    way out was unsafe, so staying put is the whole of our advice. Only a person
+    can improve on that, which makes them the most dispatcher-shaped call we have.
+    """
+    if status == "escalated" or refused:
         return 0
     if need == "medical":
         return 1
     return 2
+
+
+def _unit(state: CallState) -> str | None:
+    """The help this call needs. Chosen here, never by a second model call."""
+    if state.need == "medical":
+        return "Ambulance"
+    if state.need == "fire":
+        return "Fire engine"
+    if state.need == "shelter" or state.mobility == "trapped":
+        return "Rescue team"
+    return None
+
+
+def _speak_help(state: CallState, direction: str, incident: dict) -> tuple[CallState, str, dict]:
+    """The agent takes the call. The unit is spoken once, in this same sentence."""
+    if state.help_sent or not (state.origin_label or state.place):
+        return state, direction, incident
+    unit = _unit(state)
+    if not unit:
+        return state, direction, incident
+    direction = f"{direction} {_help_line(unit)}"
+    incident = dict(incident)
+    incident["auto_help"] = unit
+    return replace(state, help_sent=unit), direction, incident
+
+
+def _help_line(unit: str) -> str:
+    if unit == "Ambulance":
+        return "An ambulance is on the way to you."
+    if unit == "Fire engine":
+        return "A fire engine is on the way to you."
+    return "A rescue team is on the way to you."
 
 
 def _stay(need: str | None) -> str:

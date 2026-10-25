@@ -46,4 +46,5 @@ def route(lat: float, lon: float, hazard: str | None, need: str | None,
     wind = feeds.wind(lat, lon)          # cached; never blocks on a cold network
     if wind:
         drift = float(wind["to_deg"])
-    return geo.choose((lat, lon), places, hazard, need, drift, origin_name)
+    perimeters = feeds.fire_rings(lat, lon)   # cached the same way; last-good on failure
+    return geo.choose((lat, lon), places, hazard, need, drift, origin_name, perimeters)

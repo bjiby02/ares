@@ -12,3 +12,10 @@ devcert/
 
 __pycache__/
 *.pyc
+
+# account-specific resource ids, created by tunnel.sh / agent setup
+data/agent_id
+data/phone_id
+
+# demo renders: large, regenerable
+*.mp4

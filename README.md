@@ -93,9 +93,6 @@ Then, in another terminal:
 # the dispatcher console
 open "http://127.0.0.1:8810/console?token=$(cat data/api_token)&as=Engine%2035"
 
-# the browser voice client
-open "http://127.0.0.1:8810/talk?token=$(cat data/api_token)"
-
 # rehearse a turn without a handset
 curl -s --get http://127.0.0.1:8810/preview \
   --data-urlencode "token=$(cat data/api_token)" \
@@ -176,7 +173,6 @@ modification.
 | `voice.py` | 82 | TwiML render, E.164, Twilio signature |
 | `run.py` | 14 | Entry point. Parses `.env` safely (values with spaces survive) |
 | `web/console.*` | — | Dispatcher console: map, layers, alert feed, cameras, lanes, actions |
-| `web/talk.*` | — | Browser voice client: WebRTC, tool relay, live/async lanes |
 | `tests/` | 446 | `test_flow`, `test_product`, `test_swarm` |
 
 ---
@@ -205,7 +201,6 @@ All token-guarded except `/health` and the Twilio webhooks.
 | `/voice`, `/gather` | POST | Twilio webhook, signature-checked |
 | `/preview` | GET | Rehearse a turn without a handset |
 | `/console` | GET | Dispatcher console |
-| `/talk` | GET | Browser voice client |
 | `/v1/live/offer` | POST | Browser SDP offer in, GPT-Live SDP answer out |
 | `/v1/tools/{name}` | POST | `find_place`, `plan_route`, `escalate`, `close_call` |
 | `/v1/tools/schema` | GET | Tool schemas, prompt, `session.update` body |
@@ -293,11 +288,10 @@ call time.
 | Pri | Task | Blocked by | Notes |
 |---|---|---|---|
 | 1 | Buy a Twilio number | payment method | Account is Trial, $0.00, 0 numbers. **Nobody can dial until this exists.** Then set `TWILIO_PHONE_NUMBER` and point VoiceUrl at `{PUBLIC_BASE_URL}/voice` |
-| 2 | Verify `/talk` with a live mic | a browser | Server side proven: SDP answer returns, tools arm. The audio loop itself is unverified |
-| 3 | `OPERATOR_RESPONDER_NUMBER` | a phone number | Not currently used — notification is voice-only by design |
-| 4 | Spanish | — | Large local need. Needs a model harness; the rules fallback is English-only |
-| 5 | Proactive callback | a number | When a new report puts hazard in the direction someone was sent, call them back |
-| 6 | Real CAD integration | an agency | Unit rows in the console are notional. This is the integration point |
+| 2 | `OPERATOR_RESPONDER_NUMBER` | a phone number | Not currently used — notification is voice-only by design |
+| 3 | Spanish | — | Large local need. Needs a model harness; the rules fallback is English-only |
+| 4 | Proactive callback | a number | When a new report puts hazard in the direction someone was sent, call them back |
+| 5 | Real CAD integration | an agency | Unit rows in the console are notional. This is the integration point |
 
 ### Invariants — do not weaken these
 
@@ -334,8 +328,6 @@ cleanly on stage.
 
 - **No phone number yet.** The dial path is code-complete and signature-verified
   but has never carried a real call.
-- **Browser voice is unverified end to end.** SDP negotiation returns a valid
-  1482-byte answer and tools arm correctly; the audio loop needs a human.
 - **GPT-Live is WebRTC only.** There is no SIP dial-in and no server-side session
   mint on this API surface. Earlier claims of SIP were wrong.
 - **Console unit rows are notional.** There is no CAD feed. Say so if asked.

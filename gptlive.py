@@ -30,15 +30,15 @@ def status(public_base: str) -> dict:
     return {
         "configured": configured(),
         "model": MODEL,
-        "transport": "gpt-live/webrtc" if configured() else "twilio/twiml",
+        "transport": "gpt-live" if configured() else "unavailable",
         "tool_endpoint": f"{public_base.rstrip('/')}/v1/tools",
         "tool_count": len(tools.SCHEMA),
         "tool_names": [t["name"] for t in tools.SCHEMA],
         "session": cfg,
         "reason": None if configured() else "OPENAI_API_KEY is not set",
-        "note": ("gpt-live-1 is WebRTC only: a session needs an SDP offer from a "
-                 "browser. There is no server-side session mint and no SIP dial-in "
-                 "on this API surface."),
+        "note": ("Every call is a GPT-Live session. A browser connects over WebRTC. "
+                 "A phone call is bridged with a Twilio media stream into the same "
+                 "model. There is no gather loop."),
     }
 
 

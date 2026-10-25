@@ -10,6 +10,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import bridge
 import classify
 import dialogue
 import geo
@@ -102,6 +103,13 @@ def test_classifier_keeps_a_building_out_of_the_hazard():
     assert hurt["action"] == "guide"
     assert hurt["need"] == "medical"
     assert hurt["place"] == "Price Center"
+    breath = classify.fallback("I cannot breathe and I am at Price Center")
+    assert breath["action"] == "escalate"
+    assert breath["need"] == "medical"
+    flame = classify.fallback("the fire is inside and I am at Birch Aquarium")
+    assert flame["action"] == "escalate"
+    assert flame["need"] == "fire"
+    assert flame["place"] == "Birch Aquarium"
 
 
 def test_a_local_namesake_is_the_question_not_a_library_across_the_country():
@@ -139,6 +147,8 @@ def test_the_call_asks_before_it_sends_anyone_walking():
     assert routed["n"] == 1
     assert "Helen Palmer" in second.say
     assert "Head east, away from the smoke, about 1.2 kilometers, toward UC San Diego Health, La Jolla Campus." in second.say
+    assert "fire engine is on the way" in second.say.lower()
+    assert second.incident["auto_help"] == "Fire engine"
     # Voice only: the instruction is spoken, never texted, and no map is sent.
     assert second.sms == ""
     assert "texting" not in second.say
@@ -158,16 +168,34 @@ def test_a_trapped_caller_is_not_given_a_map():
 
     effect = ask(dialogue.CallState(phone="+15551212"), "I am trapped inside Geisel Library", router=explode)
     assert effect.action == "escalate"
-    assert effect.listen is False
+    assert effect.listen is True
     # Voice only: nothing is texted, and no map exists to follow.
     assert effect.sms == ""
     assert "map" not in effect.say.lower()
     assert "Stay low" in effect.say
+    assert "rescue team is on the way" in effect.say.lower()
+    assert effect.incident["auto_help"] == "Rescue team"
     assert effect.responder_sms.startswith("OPERATOR P0 incident")
     assert effect.state.origin_name == "Geisel Library"
     later = ask(effect.state, "I am inside the lobby", router=explode)
     assert later.action == "escalate"
     assert "update" in later.responder_sms
+    assert "on the way" not in later.say
+    breath = ask(
+        dialogue.CallState(
+            phone="m", place="Price Center", origin_label="Price Center in San Diego",
+            origin_lat=32.88, origin_lon=-117.24,
+        ),
+        "I cannot breathe",
+        router=explode,
+    )
+    assert "Stay still" in breath.say
+    assert "ambulance is on the way" in breath.say.lower()
+    assert breath.incident["auto_help"] == "Ambulance"
+    lost = ask(dialogue.CallState(phone="z"), "I cannot get out", router=explode)
+    assert "What building are you in?" in lost.say
+    assert "on the way" not in lost.say
+    assert "auto_help" not in lost.incident
 
 
 def test_outage_and_unsafe_routes_do_not_invent_a_building():
@@ -184,6 +212,7 @@ def test_outage_and_unsafe_routes_do_not_invent_a_building():
 
     blocked = ask(dialogue.CallState(phone="b"), "I am at Price Center and there is smoke to the south", router=none)
     assert "will not send you toward the danger" in blocked.say
+    assert "fire engine is on the way" in blocked.say.lower()
     assert blocked.sms == ""
 
 
@@ -193,13 +222,15 @@ def test_hurt_callers_get_a_hospital_and_can_close():
     assert effect.incident["priority"] == 1
     assert effect.incident["need"] == "medical"
     assert "away from the smoke" not in effect.say
+    assert "ambulance is on the way" in effect.say.lower()
+    assert effect.incident["auto_help"] == "Ambulance"
     assert effect.responder_sms == ""
     effect.state.incident_id = 7
     effect.state.incident_status = "guided"
     closed = ask(effect.state, "I am safe now")
     assert closed.action == "close"
     assert closed.listen is False
-    assert "7" in closed.say
+    assert closed.say == "Call again if you need to."
     assert closed.responder_sms == ""
 
 
@@ -224,6 +255,29 @@ def test_repeat_and_twiml():
     asking = voice.twiml("https://example.com", "Where are you?")
     assert "<Gather" in asking
     assert "<Message" not in asking
+
+
+def test_a_phone_call_opens_gpt_live():
+    body = voice.live_stream(
+        "wss://example.com/v1/live/stream",
+        {"token": "abc", "From": "+16195550000", "FromCity": "San Diego", "CallSid": "CA1"},
+    )
+    assert "<Connect>" in body
+    assert "<Stream " in body
+    assert 'url="wss://example.com/v1/live/stream"' in body
+    assert 'name="token" value="abc"' in body
+    assert 'name="from" value="+16195550000"' in body
+    assert "stream?token" not in body
+    assert "<Gather" not in body
+    assert "<Say" not in body
+    escaped = voice.live_stream("wss://example.com/v1/live/stream", {"FromCity": "A & B", "token": "a&b"})
+    assert "A &amp; B" in escaped
+    assert 'value="a&amp;b"' in escaped
+    assert "<Gather" not in voice.unavailable()
+    frame = bridge.encode_frame(1, b"hello", mask=True)
+    opcode, fin, payload, rest = bridge.take_frame(frame)
+    assert opcode == 1 and fin and payload == b"hello" and rest == b""
+    assert bridge.take_frame(frame[:3]) is None
 
 
 def test_signature():
@@ -261,7 +315,8 @@ def test_incidents_survive_and_retries_do_not_duplicate():
         assert first.fresh and first.changed
         assert not second.fresh
         assert first.twiml == second.twiml
-        assert "Incident 1" in first.say
+        assert "Incident" not in first.say
+        assert first.incident_id == 1
         assert len(db.incidents()) == 1
         state = db.load("+15551212")
         assert state.incident_id == 1
@@ -274,10 +329,47 @@ def test_incidents_survive_and_retries_do_not_duplicate():
         assert len(rows) == 1
         assert rows[0]["hazard"] == "S"
         assert rows[0]["status"] == "escalated"
+        assert rows[0]["responder_state"] == "en_route"
+        assert rows[0]["responder_note"] == "Rescue team"
+        assert rows[0]["caller_told"] == 1
         assert "Geisel" in (rows[0]["place_name"] or "")
         db.db.execute("UPDATE incidents SET updated_at = ? WHERE id = 1", ("2000-01-01T00:00:00Z",))
         assert db.load("+15551212").incident_id is None
 
+
+def test_a_caller_who_dials_back_is_not_asked_everything_again():
+    """Hanging up must not cost the caller their place in the conversation."""
+    state = dialogue.CallState(phone="+15557001", call_sid="CA-1")
+    effect = dialogue.step(
+        state,
+        "I am at Price Center and there is smoke to the south",
+        classify=lambda text: {"action": "guide", "place": "Price Center", "hazard": "S",
+                               "need": "fire", "mobility": "mobile"},
+        origins=lambda query: PRICE,
+        route=lambda lat, lon, hazard, need, origin: HOSPITAL,
+    )
+    assert effect.action == "guide"
+    carried = effect.state
+    assert carried.destination_name == HOSPITAL.name
+
+    # The call drops. Twilio sends a new CallSid, so the live line is cleared.
+    redial = dialogue.replace(carried, call_sid="CA-2", last_say=None)
+    back = dialogue.greet(redial)
+    assert back.action == "resume"
+    assert "Price Center" in back.say
+    assert HOSPITAL.name in back.say
+    assert back.say.endswith("Are you on your way?")
+
+    # A trapped caller is asked about the room, never about a route.
+    stuck = dialogue.replace(redial, incident_status="escalated", help_sent="Ambulance")
+    stuck_say = dialogue.greet(stuck).say
+    assert "Are you still inside?" in stuck_say
+    assert "An ambulance is on the way to you." in stuck_say
+
+    # A stranger, and a caller who already closed, both hear the plain opening.
+    assert dialogue.greet(dialogue.CallState(phone="+15557002")).say == dialogue.OPENING
+    done = dialogue.replace(redial, incident_status="closed")
+    assert dialogue.greet(done).say == dialogue.OPENING
 
 if __name__ == "__main__":
     test_jev_refuses_to_invent_a_place_and_gates_on_confidence()
@@ -288,6 +380,8 @@ if __name__ == "__main__":
     test_outage_and_unsafe_routes_do_not_invent_a_building()
     test_hurt_callers_get_a_hospital_and_can_close()
     test_repeat_and_twiml()
+    test_a_phone_call_opens_gpt_live()
     test_signature()
     test_incidents_survive_and_retries_do_not_duplicate()
+    test_a_caller_who_dials_back_is_not_asked_everything_again()
     print("ok")

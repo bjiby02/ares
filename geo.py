@@ -85,6 +85,47 @@ US_STATES = {
     "va": "virginia", "wa": "washington", "wv": "west virginia", "wi": "wisconsin", "wy": "wyoming",
     "dc": "district of columbia",
 }
+_AREA: tuple[float, float] | None = None
+
+
+def bind_area(lat: float, lon: float) -> None:
+    """Tell the geocoders where we answer calls. Set once, at boot."""
+    global _AREA
+    _AREA = (float(lat), float(lon))
+
+
+def area_centre() -> tuple[float, float] | None:
+    if _AREA is not None:
+        return _AREA
+    try:
+        return float(os.environ["OPERATOR_AREA_LAT"]), float(os.environ["OPERATOR_AREA_LON"])
+    except (KeyError, ValueError):
+        return None
+
+
+# How far out of the service area a result may sit before it is "somewhere else".
+LOCAL_M = 80_000.0
+
+
+def _prefer_local(hits: list[Hit]) -> list[Hit]:
+    """Put results near the service area first, without discarding the rest.
+
+    A caller who says "Student Services Center" means the one they can walk to.
+    The geocoders rank globally, so the local building can fall past the cut.
+    Sorting before the cut is what keeps it in the list.
+    """
+    centre = area_centre()
+    if centre is None:
+        return hits
+    clat, clon = centre
+
+    def rank(hit: Hit) -> tuple[int, float]:
+        far = haversine_m(clat, clon, hit.lat, hit.lon)
+        return (0 if far <= LOCAL_M else 1, far)
+
+    return sorted(hits, key=rank)
+
+
 _NOMINATIM = threading.Lock()
 _LAST_NOMINATIM = 0.0
 
@@ -217,6 +258,52 @@ def walkable(origin: tuple[float, float], place: Place) -> bool:
     return True
 
 
+def inside_ring(lat: float, lon: float, ring: list) -> bool:
+    """Point in polygon, by ray casting. Ring points are [lon, lat]."""
+    hit = False
+    count = len(ring)
+    for index in range(count):
+        x1, y1 = ring[index][0], ring[index][1]
+        x2, y2 = ring[(index + 1) % count][0], ring[(index + 1) % count][1]
+        if (y1 > lat) != (y2 > lat):
+            cut = (x2 - x1) * (lat - y1) / ((y2 - y1) or 1e-15) + x1
+            if lon < cut:
+                hit = not hit
+    return hit
+
+
+def in_fire(lat: float, lon: float, perimeters: list | None) -> dict | None:
+    """The fire whose outline contains this point, when there is one."""
+    for fire in perimeters or []:
+        for ring in fire.get("rings") or []:
+            if inside_ring(lat, lon, ring):
+                return fire
+    return None
+
+
+def clear_of_fire(origin: tuple[float, float], place: Place,
+                  perimeters: list | None) -> bool:
+    """False when the destination sits in a mapped fire, or the walk enters one.
+
+    The caller's own bearing is one person's word. A published perimeter is a
+    measured outline. We refuse to cross it even when the caller never named it.
+    """
+    if not perimeters:
+        return True
+    olat, olon = origin
+    if in_fire(place.lat, place.lon, perimeters):
+        return False
+    for fire in perimeters:
+        for ring in fire.get("rings") or []:
+            count = len(ring)
+            for index in range(count):
+                x1, y1 = ring[index][0], ring[index][1]
+                x2, y2 = ring[(index + 1) % count][0], ring[(index + 1) % count][1]
+                if _crosses(olon, olat, place.lon, place.lat, x1, y1, x2, y2):
+                    return False
+    return True
+
+
 _PLACE_NOISE = {"the", "of", "at", "assembly", "area", "point", "centre", "center"}
 
 
@@ -236,7 +323,7 @@ def _same_place(origin_name: str, dest_name: str) -> bool:
 
 def choose(origin: tuple[float, float], places: list[Place], hazard: str | None,
            need: str | None = None, drift: float | None = None,
-           origin_name: str | None = None) -> Place | None:
+           origin_name: str | None = None, perimeters: list | None = None) -> Place | None:
     """Nearest staffed building that is not toward the hazard.
 
     Kind H is a hospital or clinic. Kind R is a refuge supplied by the operator,
@@ -252,6 +339,12 @@ def choose(origin: tuple[float, float], places: list[Place], hazard: str | None,
     dry = [place for place in pool if walkable(origin, place)]
     if dry:
         pool = dry
+    # A mapped fire is not a preference. Nothing inside one is a destination,
+    # and no walk may cross one, so this filter has no "if any survive" escape.
+    if perimeters:
+        pool = [place for place in pool if clear_of_fire(origin, place, perimeters)]
+        if not pool:
+            return None
     # A destination that shares the caller's own place name is where they already
     # stand. "From Warren Mall ... toward Warren Mall assembly area" is not a route.
     if origin_name:
@@ -373,8 +466,11 @@ def narrow(query: str, hits: list[Hit], city: str | None = None, region: str | N
     # Service area first. A campus path is kind "road"; preferring POIs before
     # locality threw away Warren Mall, San Diego in favour of a cinema in Warren, PA.
     pool = list(hits)
-    local = [hit for hit in pool if _caller_match(hit, city, region)]
-    if local:
+    # A caller in San Diego is not at a namesake in another state.
+    if city or region:
+        local = [hit for hit in pool if _caller_match(hit, city, region)]
+        if not local:
+            return []
         pool = local
     pois = [hit for hit in pool if hit.kind == "poi"]
     if pois:
@@ -404,11 +500,26 @@ def _dedup(query: str, hits: list[Hit]) -> list[Hit]:
     return kept
 
 
+def _same_name(query: str, hit: Hit) -> bool:
+    """The caller said this place's whole name, with nothing left over."""
+    return _tokens(query) == _tokens(hit.name)
+
+
 def _alternative(query: str, best: Hit, rest: list[Hit]) -> Hit | None:
     local: list[Hit] = []
     distant: list[Hit] = []
+    # Both guards below need to know that the best hit is one of ours. Without a
+    # configured service area we cannot say that, so the old behaviour stands.
+    centre = area_centre()
+    best_ours = centre is not None and haversine_m(centre[0], centre[1], best.lat, best.lon) <= LOCAL_M
+    # The caller named one building exactly. A longer name is a different
+    # building, not a namesake: "Student Services Center" is not "Student
+    # Services Center and Classrooms", and the question costs them a turn.
+    exact = _same_name(query, best)
     for hit in rest:
         if hit.kind != "poi" or not _shares(query, hit):
+            continue
+        if best_ours and exact and not _same_name(query, hit):
             continue
         meters = haversine_m(best.lat, best.lon, hit.lat, hit.lon)
         if 1500 < meters <= 80000:
@@ -417,7 +528,9 @@ def _alternative(query: str, best: Hit, rest: list[Hit]) -> Hit | None:
             distant.append(hit)
     if local:
         return max(local, key=lambda hit: _score(query, hit))
-    if distant:
+    # A namesake in another state is never the answer for a caller we already
+    # placed inside our own area. Offering it is how you lose a minute.
+    if distant and not best_ours:
         return max(distant, key=lambda hit: _score(query, hit))
     return None
 
@@ -452,7 +565,7 @@ def search(query: str) -> list[Hit]:
             errors.append(exc)
             continue
         if hits:
-            return hits[:5]
+            return _prefer_local(hits)[:5]
     if errors:
         raise LookupError(str(errors[-1]))
     return []
@@ -496,7 +609,11 @@ def trusted_refuges(lat: float, lon: float) -> list[Place]:
 
 
 def _photon_search(query: str) -> list[Hit]:
-    url = "https://photon.komoot.io/api/?" + urllib.parse.urlencode({"q": query, "limit": 5})
+    params = {"q": query, "limit": 15}
+    centre = area_centre()
+    if centre is not None:
+        params["lat"], params["lon"] = centre[0], centre[1]
+    url = "https://photon.komoot.io/api/?" + urllib.parse.urlencode(params)
     payload = _get(url, timeout=6, pace=False)
     features = payload.get("features", []) if isinstance(payload, dict) else []
     hits: list[Hit] = []
@@ -521,9 +638,14 @@ def _photon_hit(feature: dict) -> Hit | None:
 
 
 def _nominatim_search(query: str) -> list[Hit]:
-    url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(
-        {"q": query, "format": "jsonv2", "limit": 5, "addressdetails": 1}
-    )
+    params = {"q": query, "format": "jsonv2", "limit": 15, "addressdetails": 1}
+    centre = area_centre()
+    if centre is not None:
+        clat, clon = centre
+        # Prefer this box, do not restrict to it: a caller may name a place outside.
+        params["viewbox"] = f"{clon - 0.7},{clat + 0.6},{clon + 0.7},{clat - 0.6}"
+        params["bounded"] = 0
+    url = "https://nominatim.openstreetmap.org/search?" + urllib.parse.urlencode(params)
     payload = _get(url, timeout=8, pace=True)
     if not isinstance(payload, list):
         return []

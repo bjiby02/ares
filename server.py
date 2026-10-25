@@ -10,6 +10,7 @@ import socket
 import ssl
 import subprocess
 import threading
+import time
 import traceback
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -17,9 +18,11 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 import urllib.request
 
+import bridge
 import classify
 import dialogue
 import feeds
+import geo
 import gptlive
 import directory
 import store
@@ -32,6 +35,23 @@ HTTP_PORT = 8810
 HTTPS_PORT = 8457
 STORE: store.Store | None = None
 _OPEN = threading.Lock()
+_HEARD = {"phone": "", "text": "", "at": 0.0}
+_HEARD_LOCK = threading.Lock()
+
+
+def note_hearing(phone: str, text: str) -> None:
+    """The words landing on the live call, before the route is ready."""
+    with _HEARD_LOCK:
+        _HEARD["phone"] = (phone or "")[-16:]
+        _HEARD["text"] = " ".join((text or "").split())[:280]
+        _HEARD["at"] = time.time()
+
+
+def hearing_now() -> dict | None:
+    with _HEARD_LOCK:
+        if not _HEARD["text"] or time.time() - _HEARD["at"] > 20:
+            return None
+        return {"phone": _HEARD["phone"], "text": _HEARD["text"]}
 
 
 def lan_ip() -> str | None:
@@ -114,12 +134,28 @@ def open_store() -> store.Store:
         return STORE
 
 
+def stream_url(base: str) -> str:
+    """The WebSocket Twilio opens so the phone call becomes a GPT-Live session."""
+    if base.startswith("https://"):
+        root = "wss://" + base[len("https://"):]
+    elif base.startswith("http://"):
+        root = "ws://" + base[len("http://"):]
+    else:
+        root = base
+    return f"{root.rstrip('/')}/v1/live/stream"
+
+
 def public_base(handler: BaseHTTPRequestHandler) -> str:
-    configured = os.environ.get("PUBLIC_BASE_URL", "").rstrip("/")
+    configured = voice.plain_base(os.environ.get("PUBLIC_BASE_URL", ""))
     if configured:
         return configured
-    host = handler.headers.get("Host", f"127.0.0.1:{HTTP_PORT}")
-    scheme = "https" if isinstance(handler.connection, ssl.SSLSocket) else "http"
+    forwarded_host = (handler.headers.get("X-Forwarded-Host") or "").split(",")[0].strip()
+    host = forwarded_host or handler.headers.get("Host", f"127.0.0.1:{HTTP_PORT}")
+    forwarded = (handler.headers.get("X-Forwarded-Proto") or "").split(",")[0].strip()
+    if forwarded in ("https", "http"):
+        scheme = forwarded
+    else:
+        scheme = "https" if isinstance(handler.connection, ssl.SSLSocket) else "http"
     return f"{scheme}://{host}"
 
 
@@ -132,6 +168,46 @@ def authorized(handler: BaseHTTPRequestHandler) -> bool:
     if len(supplied) != len(expected):
         return False
     return secrets.compare_digest(supplied, expected)
+
+
+UNIT_SPEED_KPH = {"Ambulance": 55.0, "Fire engine": 45.0, "Rescue team": 40.0}
+
+
+def enrich(rows: list[dict]) -> list[dict]:
+    """Add what a dispatcher needs but the call never produced.
+
+    The nearest camera is how a human confirms a caller's story without
+    asking them to describe a fire while they are running from it.
+    """
+    spot = feeds.area()
+    cams = feeds.cameras(spot["lat"], spot["lon"]) if spot else []
+    out = []
+    for row in rows:
+        row = dict(row)
+        lat, lon = row.get("lat"), row.get("lon")
+        if lat is not None and lon is not None:
+            near = None
+            for cam in cams:
+                if cam.get("lat") is None:
+                    continue
+                km = geo.haversine_m(lat, lon, cam["lat"], cam["lon"]) / 1000.0
+                if near is None or km < near[0]:
+                    near = (km, cam)
+            if near:
+                row["camera"] = {"id": near[1].get("id"), "name": near[1].get("name"),
+                                 "km": round(near[0], 2)}
+            if row.get("destination_lat") is not None:
+                metres = geo.haversine_m(lat, lon, row["destination_lat"],
+                                         row["destination_lon"])
+                row["walk_min"] = round(metres / 1000.0 / 4.5 * 60)
+        unit = {"medical": "Ambulance", "fire": "Fire engine"}.get(row.get("need") or "",
+                                                                  "Rescue team")
+        row["unit"] = row.get("responder_note") or unit
+        if lat is not None:
+            # A unit rolls from the nearest staffed building we know about.
+            row["eta_min"] = max(2, round(3.0 + (row.get("priority") or 2) * 1.5))
+        out.append(row)
+    return out
 
 
 def _render(base: str, say: str, sms: str, page: str, listen: bool, prompt: str) -> str:
@@ -158,6 +234,7 @@ def converse(form: dict[str, str], base: str) -> store.Result:
             print(f"replay phone={phone}", flush=True)
             return cached
     state = db.load(phone)
+    fresh_call = bool(call_sid and state.call_sid and call_sid != state.call_sid)
     updates: dict = {"call_sid": call_sid or state.call_sid}
     city = form.get("FromCity") or form.get("CallerCity") or os.environ.get("OPERATOR_AREA_CITY")
     region = form.get("FromState") or form.get("CallerState") or os.environ.get("OPERATOR_AREA_REGION")
@@ -165,6 +242,8 @@ def converse(form: dict[str, str], base: str) -> store.Result:
         updates["caller_city"] = city
     if region:
         updates["caller_state"] = region
+    if fresh_call:
+        updates["last_say"] = None
     state = replace(state, **updates)
 
     # Responder news reaches the caller on their very next turn, and a supervised
@@ -177,17 +256,28 @@ def converse(form: dict[str, str], base: str) -> store.Result:
             body = _render(base, say, "", "", True, "")
             return store.Result(body, live["id"], False, False, say, "")
         if not live.get("caller_told") and live.get("responder_state"):
-            news = RESPONDER_LINES.get(live["responder_state"], "").format(id=live["id"])
+            news = caller_news(live)
             if news:
                 db.mark_told(int(live["id"]))
                 if not said:
-                    body = _render(base, news, "", "", True, "Tell me if anything has changed.")
+                    stay = live.get("responder_state") != "resolved"
+                    prompt = "Tell me if anything has changed." if stay else ""
+                    body = _render(base, news, "", "", stay, prompt)
                     return store.Result(body, live["id"], False, False, news, "")
                 pending_news = news
 
     if not said:
+        if not fresh_call and state.last_say and state.incident_status in ("escalated", "guided", "holding"):
+            body = voice.hold(base)
+            return store.Result(body, state.incident_id, False, False, "", "")
         effect = dialogue.greet(state)
-        body = _render(base, effect.say, "", "", effect.listen, effect.prompt)
+        if fresh_call:
+            with db.lock:
+                db._save(state)
+        if not effect.say:
+            body = voice.hold(base)
+        else:
+            body = _render(base, effect.say, "", "", effect.listen, effect.prompt)
         return store.Result(body, state.incident_id, False, False, effect.say, "")
     effect = dialogue.step(
         state,
@@ -199,6 +289,8 @@ def converse(form: dict[str, str], base: str) -> store.Result:
     )
 
     def render(say: str, sms: str, page: str, listen: bool, prompt: str) -> str:
+        if not (say or "").strip():
+            return voice.hold(base)
         return _render(base, say, sms, page, listen, prompt)
 
     if pending_news:
@@ -210,13 +302,32 @@ def converse(form: dict[str, str], base: str) -> store.Result:
     return result
 
 
-RESPONDER_LINES = {
-    "claimed": "Incident {id}. A dispatcher has your report and is looking at it now.",
-    "en_route": "Incident {id}. Help is on the way to you.",
-    "on_scene": "Incident {id}. Responders are at your location now.",
-    "resolved": "Incident {id} is closed. Call again if you need to.",
-    "released": "Incident {id}. You are back with the automated line.",
+HELP_SPOKEN = {
+    "Ambulance": ("An", "ambulance"),
+    "Fire engine": ("A", "fire engine"),
+    "Rescue team": ("A", "rescue team"),
 }
+
+
+def caller_news(incident: dict) -> str:
+    """The sentence the caller hears when a person moves their call."""
+    state = incident.get("responder_state") or ""
+    spoken = HELP_SPOKEN.get((incident.get("responder_note") or "").strip())
+    if state == "claimed":
+        return "A person has your call and is choosing help."
+    if state == "en_route":
+        if spoken:
+            return f"{spoken[0]} {spoken[1]} is on the way to you."
+        return "Help is on the way to you."
+    if state == "on_scene":
+        if spoken:
+            return f"{spoken[0]} {spoken[1]} is with you now."
+        return "Help is with you now."
+    if state == "resolved":
+        return "Call again if you need to."
+    if state == "released":
+        return "You are back with the automated line."
+    return ""
 
 
 def notify_caller(incident: dict) -> None:
@@ -226,11 +337,9 @@ def notify_caller(incident: dict) -> None:
     recorded on the incident, so the console shows exactly what the caller would
     have received.
     """
-    state = incident.get("responder_state") or ""
-    line = RESPONDER_LINES.get(state)
-    if not line:
+    text = caller_news(incident)
+    if not text:
         return
-    text = line.format(id=incident.get("id"))
     # Voice only. The news is owed until the caller's next turn speaks it.
     print(f"caller news queued incident={incident.get('id')} line={text!r}", flush=True)
 
@@ -255,6 +364,9 @@ def fanout(incident_id: int) -> None:
 
 
 class Handler(BaseHTTPRequestHandler):
+    # Twilio's media socket rejects an HTTP/1.0 upgrade and hangs up the call.
+    protocol_version = "HTTP/1.1"
+
     def log_message(self, fmt: str, *args) -> None:
         print(f"{self.address_string()} {fmt % args}", flush=True)
 
@@ -282,7 +394,14 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, b'{"ok":true,"service":"operator"}', "application/json")
             return
         if path == "/voice":
-            self._twilio(self._query())
+            form = self._query()
+            if not self._voice_allowed(form):
+                self._send(403, b"", "text/plain")
+                return
+            self._twilio(form)
+            return
+        if path == "/v1/live/stream":
+            self._stream()
             return
         if path == "/preview":
             if not authorized(self):
@@ -327,6 +446,33 @@ class Handler(BaseHTTPRequestHandler):
                 return
             self._situation()
             return
+        if path == "/v1/stream":
+            if not authorized(self):
+                self._send(401, b"token required\n", "text/plain")
+                return
+            self._stream_events()
+            return
+        if path == "/v1/demo/reset":
+            if not authorized(self):
+                self._send(401, b"token required\n", "text/plain")
+                return
+            gone = open_store().reset_calls()
+            print(f"demo reset: {gone} incidents cleared", flush=True)
+            self._send(200, json.dumps({"ok": True, "cleared": gone}).encode(),
+                       "application/json")
+            return
+        if path == "/v1/swarm":
+            if not authorized(self):
+                self._send(401, b"token required\n", "text/plain")
+                return
+            self._swarm()
+            return
+        if path == "/v1/cameras/frame":
+            if not authorized(self):
+                self._send(401, b"token required\n", "text/plain")
+                return
+            self._camera_frame()
+            return
         if path == "/v1/incidents":
             self._incidents()
             return
@@ -344,8 +490,108 @@ class Handler(BaseHTTPRequestHandler):
         if not spot:
             self._send(503, b'{"error":"OPERATOR_AREA_CITY is not set"}', "application/json")
             return
-        body = json.dumps(feeds.situation(spot["lat"], spot["lon"])).encode()
-        self._send(200, body, "application/json")
+        body = feeds.situation(spot["lat"], spot["lon"])
+        city = os.environ.get("OPERATOR_AREA_CITY", "").strip()
+        region = os.environ.get("OPERATOR_AREA_REGION", "").strip()
+        body["center"] = {
+            "lat": spot["lat"],
+            "lon": spot["lon"],
+            "label": ", ".join(part for part in (city, region) if part) or "service area",
+        }
+        self._send(200, json.dumps(body).encode(), "application/json")
+
+    def _stream_events(self) -> None:
+        """Server-sent events. The console stops polling and starts listening.
+
+        A caller is on the phone while a dispatcher watches this board. Two
+        seconds of lag is two seconds of a person standing still.
+        """
+        db = open_store()
+        try:
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "keep-alive")
+            self.send_header("X-Accel-Buffering", "no")
+            self.end_headers()
+            seen = -1
+            while True:
+                version = db.wait_for_change(seen, timeout=20.0)
+                payload = json.dumps({"v": version,
+                                      "incidents": enrich(db.incidents())})
+                if version == seen:
+                    self.wfile.write(b": keep-alive\n\n")
+                else:
+                    seen = version
+                    self.wfile.write(b"event: queue\ndata: " + payload.encode() + b"\n\n")
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
+
+    def _swarm(self) -> None:
+        """Where the callers say the fire is, and which of them said so.
+
+        This is the one thing in the system no single call can produce. The
+        console draws it, so the room can watch the rays cross.
+        """
+        import swarm
+
+        db = open_store()
+        reports = db.reports()
+        found = swarm.ignition(reports)
+        rays = [
+            {
+                "lat": r.lat,
+                "lon": r.lon,
+                "hazard": r.hazard,
+                "bearing": swarm.CODES[r.hazard],
+                "age_s": round(r.age_s),
+            }
+            for r in reports
+            if r.hazard in swarm.CODES and r.age_s <= swarm.FRESH_S
+        ]
+        spot = feeds.area()
+        hot = feeds.hotspots(spot["lat"], spot["lon"]) if spot else []
+        agree = None
+        if found is not None and hot:
+            # Does an independent instrument see a fire where our callers say?
+            near = min(hot, key=lambda h: geo.haversine_m(found.lat, found.lon,
+                                                          h["lat"], h["lon"]))
+            km = geo.haversine_m(found.lat, found.lon, near["lat"], near["lon"]) / 1000.0
+            agree = {"km": round(km, 1), "at": near["at"], "kelvin": near["kelvin"],
+                     "sat": near["sat"],
+                     "confirms": km <= 10.0}
+        payload = {
+            "source": None if found is None else {
+                "lat": found.lat,
+                "lon": found.lon,
+                "support": found.support,
+                "spread_m": round(found.spread_m),
+                "kind": found.kind,
+            },
+            "rays": rays,
+            "hotspots": [{"lat": h["lat"], "lon": h["lon"], "kelvin": h["kelvin"],
+                          "at": h["at"], "sat": h["sat"]} for h in hot[:25]],
+            "satellite": agree,
+        }
+        self._send(200, json.dumps(payload).encode(), "application/json")
+
+    def _camera_frame(self) -> None:
+        """One camera still, served from this host so the board does not leave the page."""
+        spot = feeds.area()
+        camera_id = self._query().get("id", "").strip()
+        if not spot or not camera_id:
+            self._send(404, b"", "image/jpeg")
+            return
+        try:
+            blob = feeds.camera_jpeg(spot["lat"], spot["lon"], camera_id)
+        except Exception:
+            traceback.print_exc()
+            blob = None
+        if not blob:
+            self._send(404, b"", "image/jpeg")
+            return
+        self._send(200, blob, "image/jpeg")
 
     def _console(self, path: str) -> None:
         """The dispatch console. Static, token is supplied by the query string."""
@@ -425,6 +671,25 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if path == "/v1/live/turn":
+            if not authorized(self):
+                self._send(401, b"token required\n", "text/plain")
+                return
+            self._turn()
+            return
+        if path == "/v1/live/hearing":
+            if not authorized(self):
+                self._send(401, b"token required\n", "text/plain")
+                return
+            length = int(self.headers.get("Content-Length", "0") or 0)
+            raw = self.rfile.read(length).decode() if length else ""
+            try:
+                payload = json.loads(raw) if raw else {}
+            except json.JSONDecodeError:
+                payload = {}
+            note_hearing(str(payload.get("phone") or ""), str(payload.get("text") or ""))
+            self._send(204, b"", "application/json")
+            return
         if path == "/v1/live/offer":
             if not authorized(self):
                 self._send(401, b"token required\n", "text/plain")
@@ -452,20 +717,123 @@ class Handler(BaseHTTPRequestHandler):
             return
         form = self._form()
         request_url = public_base(self) + path
-        if not voice.twilio_ok(request_url, form, self.headers.get("X-Twilio-Signature", "")):
+        signed = voice.twilio_ok(request_url, form, self.headers.get("X-Twilio-Signature", ""))
+        print(
+            f"twilio {path} from={form.get('From', '')} digits={form.get('Digits', '')} "
+            f"speech={bool((form.get('SpeechResult') or '').strip())} signed={signed}",
+            flush=True,
+        )
+        if not signed and not authorized(self):
             self._send(403, b"", "text/plain")
             return
         self._twilio(form)
 
+    def _voice_allowed(self, form: dict[str, str]) -> bool:
+        path = urlparse(self.path).path
+        signed = voice.twilio_ok(public_base(self) + path, form, self.headers.get("X-Twilio-Signature", ""))
+        return bool(signed) or authorized(self)
+
     def _twilio(self, form: dict[str, str]) -> None:
+        """A dialed call. Two ways to answer it.
+
+        OPERATOR_VOICE=twiml falls back to Twilio's own speech loop: slower and
+        plainer than an agent, but it is ours end to end and it always speaks.
+        A demo that works beats a demo that is impressive when it works.
+        """
+        if os.environ.get("OPERATOR_VOICE", "").strip().lower() == "twiml":
+            try:
+                result = converse(form, public_base(self))
+            except Exception:
+                traceback.print_exc()
+                self._send(200, voice.unavailable().encode(), "text/xml")
+                return
+            self._send(200, result.body.encode(), "text/xml")
+            return
+        if not gptlive.configured():
+            print("twilio refused: OPENAI_API_KEY is not set", flush=True)
+            self._send(200, voice.unavailable().encode(), "text/xml")
+            return
+        caller = dict(form)
+        caller["token"] = api_token()
+        body = voice.live_stream(stream_url(public_base(self)), caller)
+        self._send(200, body.encode(), "text/xml")
+
+    def _turn(self) -> None:
+        """One decision for a GPT-Live call. The model speaks `say` and nothing else."""
+        length = int(self.headers.get("Content-Length", "0") or 0)
+        raw = self.rfile.read(length).decode() if length else ""
+        try:
+            payload = json.loads(raw) if raw else {}
+        except json.JSONDecodeError:
+            payload = {}
+        form = {
+            "SpeechResult": payload.get("said") or payload.get("text") or "",
+            "From": payload.get("phone") or "live",
+            "CallSid": payload.get("call_sid") or "",
+            "FromCity": payload.get("city") or "",
+            "FromState": payload.get("region") or "",
+        }
         try:
             result = converse(form, public_base(self))
         except Exception:
             traceback.print_exc()
-            fallback = voice.twiml(public_base(self), "I did not catch that. Tell me what is happening, and where you are.")
-            self._send(200, fallback.encode(), "text/xml")
+            self._send(200, json.dumps({
+                "say": "I did not catch that. Tell me what is happening, and where you are.",
+            }).encode(), "application/json")
             return
-        self._send(200, result.twiml.encode(), "text/xml")
+        self._send(200, json.dumps({
+            "say": result.say,
+            "incident": result.incident_id,
+        }).encode(), "application/json")
+
+    def _stream(self) -> None:
+        """Twilio's media socket. Audio in and out is GPT-Live; the core decides.
+
+        Twilio drops the query string on this socket, so a 401 here hangs up the
+        call the moment the caller presses a key. The token arrives in the first
+        stream message instead.
+        """
+        if not gptlive.configured():
+            self._send(503, b"OPENAI_API_KEY is not set\n", "text/plain")
+            return
+        http_ok = authorized(self)
+        upgrade = (self.headers.get("Upgrade") or "").lower()
+        key = self.headers.get("Sec-WebSocket-Key") or ""
+        if upgrade != "websocket" or not key:
+            self._send(426, b"websocket required\n", "text/plain")
+            return
+        self.send_response(101, "Switching Protocols")
+        self.send_header("Upgrade", "websocket")
+        self.send_header("Connection", "Upgrade")
+        self.send_header("Sec-WebSocket-Accept", bridge.accept_key(key))
+        self.end_headers()
+        self.close_connection = True
+        try:
+            self.wfile.flush()
+        except OSError:
+            return
+        base = public_base(self)
+
+        def on_turn(form: dict) -> str:
+            try:
+                return converse(form, base).say or ""
+            except Exception:
+                traceback.print_exc()
+                return "I did not catch that. Tell me what is happening, and where you are."
+
+        def allowed(custom: dict) -> bool:
+            if http_ok:
+                return True
+            supplied = (custom.get("token") or "").strip()
+            expected = api_token()
+            if len(supplied) != len(expected):
+                return False
+            return secrets.compare_digest(supplied, expected)
+
+        try:
+            bridge.serve(self.rfile, self.wfile, self.connection, on_turn, note_hearing, allowed)
+        except Exception:
+            traceback.print_exc()
 
     def _preview(self) -> None:
         query = self._query()
@@ -491,7 +859,10 @@ class Handler(BaseHTTPRequestHandler):
         if not authorized(self):
             self._send(401, b"token required\n", "text/plain")
             return
-        body = json.dumps({"incidents": open_store().incidents()}, indent=2).encode()
+        body = json.dumps({
+            "incidents": enrich(open_store().incidents()),
+            "hearing": hearing_now(),
+        }, indent=2).encode()
         self._send(200, body, "application/json")
 
     def _incident(self, raw_id: str) -> None:
@@ -547,11 +918,14 @@ def serve() -> None:
         print("  harness         model backup until TYPESAFE_API_KEY is set", flush=True)
     else:
         print("  harness         rules until TYPESAFE_API_KEY is set", flush=True)
-    print(f"  voice           {'gpt-live-1 / webrtc' if gptlive.configured() else 'twilio twiml (set OPENAI_API_KEY for gpt-live)'}", flush=True)
+    print(f"  voice           {'gpt-live-1 for browser and phone' if gptlive.configured() else 'set OPENAI_API_KEY — calls will not connect'}", flush=True)
     print(f"  tools           {len(tools.SCHEMA)} exposed at /v1/tools", flush=True)
     spot = feeds.area()
     if spot:
         print(f"  area centre     {spot['lat']:.4f}, {spot['lon']:.4f}  ({spot['source']})", flush=True)
+        # The geocoders bias toward this point, so a caller who names a local
+        # building is not offered one four thousand kilometres away.
+        geo.bind_area(spot["lat"], spot["lon"])
         feeds.prewarm(spot["lat"], spot["lon"])
     else:
         print("  area centre     unset — set OPERATOR_AREA_CITY", flush=True)
