@@ -7,7 +7,7 @@ python3 run.py
 Loads `.env` safely (values with spaces survive), prewarms the feed cache, binds :8810.
 
 ## Console
-http://127.0.0.1:8810/console?token=d-dbtl4wri2-fOi_351zSrSn
+http://127.0.0.1:8810/console?token=$(cat data/api_token)
 
 Polls `/v1/incidents` every 2s and `/v1/situation` every 30s. Camera tiles are
 clickable and open the real ALERTCalifornia feed.
@@ -47,7 +47,7 @@ Responder news reaches them on their next spoken turn.
 ## The responder loop
 Open the console as a unit:
 ```
-http://127.0.0.1:8810/console?token=d-dbtl4wri2-fOi_351zSrSn&as=Engine%2035
+http://127.0.0.1:8810/console?token=$(cat data/api_token)&as=Engine%2035
 ```
 Each open incident has one button: CLAIM -> ROLL -> ARRIVE -> CLOSE.
 The caller hears the change on their next turn:
@@ -59,7 +59,7 @@ The caller hears the change on their next turn:
 
 Drive it from the API instead:
 ```
-curl -s -X POST "localhost:8810/v1/incidents/<ID>/respond?token=d-dbtl4wri2-fOi_351zSrSn" \
+curl -s -X POST "localhost:8810/v1/incidents/<ID>/respond?token=$(cat data/api_token)" \
   -H 'Content-Type: application/json' \
   -d '{"state":"en_route","who":"Engine 35"}'
 ```
@@ -77,7 +77,7 @@ The geocache is deliberately left alone — that is what keeps the demo fast.
 ## Rehearse without a handset
 ```
 curl -s --get http://127.0.0.1:8810/preview \
-  --data-urlencode "token=d-dbtl4wri2-fOi_351zSrSn" \
+  --data-urlencode "token=$(cat data/api_token)" \
   --data-urlencode "phone=+16195559999" \
   --data-urlencode "q=I am at Price Center and I need to get out"
 ```
